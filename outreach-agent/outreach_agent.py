@@ -44,6 +44,10 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 # Claude-Modell für die Nachrichtengenerierung
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
+# Fester Absendername: Falls eine Nachricht unterschrieben wird, IMMER mit
+# diesem Vornamen – niemals ein erfundener Name oder ein "[Name]"-Platzhalter.
+SENDER_NAME = "Patrick"
+
 # HTTP-Header, damit Websites uns nicht sofort als Bot abweisen
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -455,6 +459,50 @@ def _extract_text(response):
     return "".join(parts).strip()
 
 
+# Phrasen, die typische Meta-Kommentare/Selbstkorrekturen einleiten. Zeilen, die
+# eine davon enthalten, werden aus dem finalen Nachrichtentext entfernt.
+META_COMMENT_MARKERS = [
+    "korrigierte version",
+    "ich habe gegen meine regel",
+    "hier die",
+    "moment –",
+    "moment -",
+    "entwurf:",
+    "version:",
+]
+
+
+def clean_message(text):
+    """
+    Sicherheitsnetz gegen Claudes Meta-Kommentare/Mehrfach-Versionen im Output.
+
+    - Enthält der Text "---", wird daran getrennt und nur das LETZTE nicht-leere
+      Segment behalten (= die korrigierte Endfassung).
+    - Zeilen, die typische Meta-Kommentar-Marker enthalten, werden entfernt.
+    - Führende/abschließende Leerzeilen werden entfernt.
+    """
+    if not text:
+        return ""
+
+    # 1. Bei "---" nur das letzte nicht-leere Segment behalten.
+    if "---" in text:
+        segments = [seg.strip() for seg in text.split("---")]
+        non_empty = [seg for seg in segments if seg]
+        if non_empty:
+            text = non_empty[-1]
+
+    # 2. Zeilen mit Meta-Kommentaren herausfiltern.
+    kept_lines = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if any(marker in lowered for marker in META_COMMENT_MARKERS):
+            continue
+        kept_lines.append(line)
+
+    # 3. Führende/abschließende Leerzeilen entfernen.
+    return "\n".join(kept_lines).strip()
+
+
 def generate_message(lead, features, variant_index=0):
     """
     Erzeugt mit Claude eine personalisierte deutsche Erstnachricht
@@ -498,6 +546,24 @@ def generate_message(lead, features, variant_index=0):
         "dann die Beobachtung.",
     ]
     chosen_style = OPENING_STYLES[variant_index % len(OPENING_STYLES)]
+
+    # Sechs grundverschiedene ARTEN, die EINE Abschlussfrage zu stellen (als
+    # Anweisung an den Schreiber, nicht als fertiger Satz). Über denselben
+    # variant_index durchrotiert, damit die Frage nicht jedes Mal gleich klingt.
+    QUESTION_STYLES = [
+        "Stelle eine knappe, direkte Frage nach dem konkreten Ablauf.",
+        "Frage danach, was an diesem Ablauf den größten Aufwand oder das größte "
+        "Ärgernis verursacht.",
+        "Stelle die Frage so, dass sie zwei mögliche Wege gegenüberstellt "
+        "(\"eher so oder eher so?\") und der Empfänger nur wählen muss.",
+        "Frage danach, wer dafür zuständig ist bzw. an wem das hängt – "
+        "interessiert, aber ohne auszufragen.",
+        "Stelle eine offene Neugier-Frage, die dem Empfänger viel Raum für seine "
+        "eigene Antwort lässt.",
+        "Setze die Frage an einem konkreten Detail der Website an, das du oben "
+        "beobachtet hast.",
+    ]
+    chosen_question_style = QUESTION_STYLES[variant_index % len(QUESTION_STYLES)]
 
     # Der "ich bin aus Mainz"-Bezug darf NICHT in jeder Nachricht vorkommen:
     # nur bei geradem variant_index erlaubt, sonst komplett weglassen.
@@ -583,20 +649,47 @@ Schreibe eine kurze, persönliche deutsche Erstnachricht nach diesen Regeln:
   offene Frage, die der Empfänger locker in einem Satz beantworten kann und die
   NICHT nach Zahlen oder einem Aufwand-Audit klingt. Sie soll Neugier zeigen,
   nicht messen.
+- FRAGE-ART (verbindliche Vorgabe): Stelle die eine Frage auf diese Art:
+  {chosen_question_style}
+- VERBOTENE FLOSKEL: Die Wendung "Wie läuft das bei Ihnen aktuell ab" und nahe
+  Varianten davon (z. B. "Wie läuft das bei Ihnen ab", "Wie handhaben Sie das
+  aktuell") dürfen NICHT verwendet werden. Formuliere die Frage anders.
+- KEINE allgemeinen Branchen-Behauptungen, die dem Empfänger sein eigenes
+  Geschäft erklären (z. B. "Dachdeckerbetriebe haben kaum eine ruhige Minute",
+  "in einer Praxis läuft vieles parallel", "in einer Zahnarztpraxis läuft die
+  Terminvergabe oft komplett übers Telefon"). Beziehe dich AUSSCHLIESSLICH auf
+  das, was konkret auf der Website beobachtet wurde – keine pauschalen Aussagen
+  über die Branche, kein Erklären, wie das Geschäft des Empfängers "üblicherweise"
+  läuft.
 - KEIN Direktverkauf, KEINE Terminanfrage, KEINE Produkterklärung. Eine mögliche
   Lösung darf höchstens ganz leise implizit anklingen, wird aber NICHT angeboten
   und NICHT erklärt.
+- KEIN verkapptes Lösungsangebot und KEIN Hinweis auf deine eigene Tätigkeit.
+  Verboten sind insbesondere Wendungen wie "ich beschäftige mich damit, wie sich
+  solche Abläufe leichter gestalten lassen", "ich helfe Unternehmen dabei, ..."
+  oder Ähnliches. Ebenfalls verboten sind Floskeln wie "nur falls das Thema
+  relevant ist" / "falls das für Sie interessant ist". Die Nachricht enthält
+  KEIN Angebot und keinen Verweis darauf, was du tust.
 - Formuliere alles in Begriffen von ABLÄUFEN, ZEIT, AUFWAND und einfacheren
   WEGEN – nicht in Begriffen von Technik.
 - ABSOLUTES WORTVERBOT: Die folgenden Wörter dürfen NICHT vorkommen (auch nicht
   in Abwandlungen): {verbotene_woerter_str}.
 - ANREDE: Verwende durchgängig die höfliche Anrede "Sie" (Siezen). Niemals
   duzen. Das gilt für die gesamte Nachricht inklusive Begrüßung und Abschluss.
+- UNTERSCHRIFT: Falls die Nachricht eine Grußformel/Unterschrift enthält, wird
+  IMMER nur mit dem Vornamen "{SENDER_NAME}" unterschrieben. Erfinde NIEMALS
+  einen anderen Namen und setze NIEMALS einen Platzhalter wie "[Name]",
+  "[Dein Name]" o. Ä.
 - Ton: locker, auf Augenhöhe, als Gründer aus Mainz, der die Praxis kennt.
   Nie aufdringlich.
 - Maximal 4–5 Sätze.
 - Gib NUR den reinen Nachrichtentext aus, ohne Betreff, ohne Anführungszeichen,
-  ohne Erklärungen drumherum."""
+  ohne Erklärungen drumherum.
+- AUSSCHLIESSLICH die fertige Nachricht: KEINE Kommentare, KEINE Meta-Erklärungen,
+  KEINE Hinweise auf Regeln oder Korrekturen, KEINE Trennlinien wie "---", KEINE
+  mehreren Versionen. Nur der eine, fertige Nachrichtentext. Falls du dich
+  korrigieren willst, gib NUR die finale korrigierte Fassung aus – nichts davor
+  und nichts danach."""
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -632,7 +725,9 @@ Schreibe eine kurze, persönliche deutsche Erstnachricht nach diesen Regeln:
             )
             message_text = _extract_text(retry_response)
 
-        return message_text
+        # Sicherheitsnetz: Meta-Kommentare / Mehrfach-Versionen bereinigen.
+        # Gilt sowohl für den Normalfall als auch nach dem Retry.
+        return clean_message(message_text)
     except Exception as exc:
         print(f"  [Fehler] Nachrichtengenerierung fehlgeschlagen: {exc}")
         return "[Fehler] Nachricht konnte nicht generiert werden."
