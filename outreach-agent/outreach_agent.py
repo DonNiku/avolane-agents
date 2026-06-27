@@ -20,6 +20,7 @@ import os
 import re
 import json
 import time
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -174,26 +175,145 @@ def search_leads(keyword, city, max_leads):
 # 3. Website-Scraping
 # ---------------------------------------------------------------------------
 
+# Bestandteile, die eine gefundene Adresse als unecht entlarven
+# (Tracking-Mails, Platzhalter, in Dateinamen/Bildern eingebettete "@" usw.).
+EMAIL_BLOCKLIST = ["sentry", "example", ".png", ".jpg", "@2x", "wixpress"]
+
+
+def extract_email(soup, text):
+    """
+    Extrahiert aus einer bereits geparsten BeautifulSoup-Instanz (soup) und
+    dem sichtbaren Text eine Kontakt-E-Mail-Adresse.
+
+    Vorgehen:
+      1. Zuerst alle mailto:-Links durchsuchen und die erste gültige Adresse
+         nehmen.
+      2. Falls keine gefunden: im Text per Regex nach E-Mail-Adressen suchen.
+      3. Adressen herausfiltern, die offensichtlich keine echten
+         Kontaktadressen sind (siehe EMAIL_BLOCKLIST).
+      4. Die erste plausible Adresse als String zurückgeben, sonst leeren
+         String. Robuste Fehlerbehandlung – kein Crash.
+    """
+    email_pattern = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+
+    def is_plausible(candidate):
+        lowered = candidate.lower()
+        return not any(bad in lowered for bad in EMAIL_BLOCKLIST)
+
+    try:
+        # 1. mailto:-Links durchsuchen.
+        if soup is not None:
+            for link in soup.find_all("a", href=True):
+                href = link["href"].strip()
+                if href.lower().startswith("mailto:"):
+                    # Adresse aus dem href lösen (Schema und ggf. ?-Parameter).
+                    address = href[len("mailto:"):].split("?")[0].strip()
+                    match = re.search(email_pattern, address)
+                    if match and is_plausible(match.group(0)):
+                        return match.group(0)
+
+        # 2. Fallback: im sichtbaren Text suchen.
+        for match in re.findall(email_pattern, text or ""):
+            if is_plausible(match):
+                return match
+    except Exception as exc:
+        print(f"  [Fehler] E-Mail-Extraktion fehlgeschlagen: {exc}")
+
+    return ""
+
+
+# Schlüsselwörter, die auf eine Kontakt-/Impressumsseite hindeuten.
+SUBPAGE_KEYWORDS = ["impressum", "kontakt", "contact", "legal"]
+
+
+def find_email_on_subpages(base_url, soup):
+    """
+    Fallback-Suche: Wenn auf der Startseite keine E-Mail gefunden wurde,
+    werden Impressum-/Kontaktseiten aufgerufen und dort gesucht.
+
+    1. Durchsucht alle a-Tags nach Links, deren sichtbarer Text ODER href
+       auf eine Kontakt-/Impressumsseite hindeutet (SUBPAGE_KEYWORDS).
+    2. Baut absolute URLs (urljoin mit base_url), sammelt max. 3 Kandidaten
+       ohne Duplikate.
+    3. Ruft jede Kandidaten-URL nacheinander auf, parst sie und wendet
+       extract_email an.
+    4. Gibt die erste gefundene E-Mail zurück, sonst leeren String.
+       Fehler pro URL werden abgefangen – kein Abbruch.
+    """
+    candidates = []
+
+    try:
+        if soup is not None:
+            for link in soup.find_all("a", href=True):
+                href = link["href"].strip()
+                link_text = link.get_text(separator=" ").strip().lower()
+                haystack = href.lower() + " " + link_text
+                if any(kw in haystack for kw in SUBPAGE_KEYWORDS):
+                    absolute = urljoin(base_url, href)
+                    if absolute not in candidates:
+                        candidates.append(absolute)
+                if len(candidates) >= 3:
+                    break
+    except Exception as exc:
+        print(f"  [Fehler] Konnte Unterseiten-Links nicht ermitteln: {exc}")
+        return ""
+
+    for index, candidate in enumerate(candidates):
+        # Kleine Pause zwischen den Aufrufen.
+        if index > 0:
+            time.sleep(1)
+
+        try:
+            response = requests.get(candidate, headers=REQUEST_HEADERS, timeout=10)
+            response.raise_for_status()
+
+            sub_soup = BeautifulSoup(response.text, "html.parser")
+            sub_text = re.sub(r"\s+", " ", sub_soup.get_text(separator=" ")).strip()
+
+            email = extract_email(sub_soup, sub_text)
+            if email:
+                return email
+        except Exception as exc:
+            print(f"  [Fehler] Konnte Unterseite '{candidate}' nicht laden: {exc}")
+            continue
+
+    return ""
+
+
 def scrape_website(url):
     """
     Holt die Seite mit requests (Timeout 10s, User-Agent-Header),
-    parst mit BeautifulSoup und gibt den sichtbaren Text zurück
-    (max. 3000 Zeichen).
+    parst mit BeautifulSoup und gibt ein Dict zurück:
+      {"text": <sichtbarer Text max. 3000 Zeichen>, "email": <Adresse oder "">}
 
-    Bei jedem Fehler wird ein leerer String zurückgegeben – kein Crash.
+    Die E-Mail wird auf der soup ermittelt, BEVOR die nicht sichtbaren Tags
+    per decompose entfernt werden (sonst wären die mailto:-Links weg).
+
+    Bei jedem Fehler wird {"text": "", "email": ""} zurückgegeben – kein Crash.
     """
     if not url:
-        return ""
+        return {"text": "", "email": ""}
 
     try:
         response = requests.get(url, headers=REQUEST_HEADERS, timeout=10)
         response.raise_for_status()
     except Exception as exc:
         print(f"  [Fehler] Konnte '{url}' nicht laden: {exc}")
-        return ""
+        return {"text": "", "email": ""}
 
     try:
         soup = BeautifulSoup(response.text, "html.parser")
+
+        # Sichtbaren Text für die E-Mail-Suche im Fließtext vorbereiten.
+        raw_text = re.sub(r"\s+", " ", soup.get_text(separator=" ")).strip()
+
+        # E-Mail ermitteln, SOLANGE die mailto-Links noch vorhanden sind.
+        email = extract_email(soup, raw_text)
+
+        # Fallback: Wenn die Startseite keine E-Mail lieferte, Impressum-/
+        # Kontaktseiten durchsuchen (soup VOR dem decompose nutzen).
+        if not email:
+            email = find_email_on_subpages(url, soup)
 
         # Nicht sichtbare / irrelevante Elemente entfernen.
         for tag in soup(["script", "style", "noscript", "head", "meta", "link"]):
@@ -202,10 +322,10 @@ def scrape_website(url):
         text = soup.get_text(separator=" ")
         # Whitespace zusammenfassen.
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:3000]
+        return {"text": text[:3000], "email": email}
     except Exception as exc:
         print(f"  [Fehler] Konnte '{url}' nicht parsen: {exc}")
-        return ""
+        return {"text": "", "email": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -538,10 +658,12 @@ def run_agent(keyword, city, max_leads):
     for index, lead in enumerate(leads, start=1):
         print(f"\n[{index}/{len(leads)}] Verarbeite: {lead['name']}")
 
-        # Website scrapen (robust – gibt notfalls leeren String zurück).
-        text = scrape_website(lead.get("website", ""))
+        # Website scrapen (robust – gibt notfalls leeres Dict zurück).
+        result = scrape_website(lead.get("website", ""))
+        text = result["text"]
+        email = result["email"]
 
-        # Features erkennen.
+        # Features erkennen (bekommt weiterhin nur den Text).
         features = detect_website_features(text)
 
         # Score berechnen.
@@ -552,6 +674,7 @@ def run_agent(keyword, city, max_leads):
 
         enriched_leads.append({
             **lead,
+            "email": email,
             "features": features,
             "score": score,
             "message": message,
