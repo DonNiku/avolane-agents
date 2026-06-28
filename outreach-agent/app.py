@@ -54,6 +54,18 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = os.getenv("SMTP_PORT")
 
+# Feste Signatur für den Direktversand an Prospects. Enthält Kontaktdaten und
+# einen einfachen Opt-out-Hinweis und wird an jede direkt versendete Mail
+# angehängt.
+SIGNATURE = """
+
+--
+Patrick
+0176 82447546
+hallo@avolane.de
+
+Wenn Sie keine weitere Nachricht von mir möchten, geben Sie mir einfach kurz Bescheid – dann melde ich mich nicht wieder."""
+
 
 # ---------------------------------------------------------------------------
 # App- und Job-Verwaltung
@@ -74,7 +86,13 @@ class RunRequest(BaseModel):
     keyword: str
     city: str
     max_leads: int = 5
-    mode: str = "draft"  # "draft" | "report" | "direct" (Etappe A: nur durchgereicht)
+    mode: str = "draft"  # "draft" | "report" | "direct"
+
+
+class SendRequest(BaseModel):
+    """Eingabe-Payload für POST /send_single (Direktversand an einen Prospect)."""
+    email: str
+    message: str
 
 
 def _update_job(job_id, **fields):
@@ -213,6 +231,61 @@ def send_report(leads, keyword, city):
         return f"SMTP-Fehler: {exc}"
 
 
+# Fester, neutraler Betreff für den Direktversand an Prospects (nicht werblich).
+DIRECT_SUBJECT = "Kurze Frage zu Ihrem Ablauf"
+
+
+def send_single_mail(to_email, subject, body):
+    """
+    Versendet EINE einzelne Plaintext-Mail an einen Prospect (Modus "direct").
+
+    - SMTP via Zoho (SMTP_HOST:SMTP_PORT), STARTTLS (Port 587), Login mit
+      EMAIL_SENDER / EMAIL_PASSWORD. Absender und Reply-To: EMAIL_SENDER.
+    - Der feste, neutrale Betreff DIRECT_SUBJECT wird verwendet (der subject-
+      Parameter wird bewusst nicht für werbliche Betreffzeilen genutzt).
+    - SIGNATURE wird an den body angehängt.
+
+    Gibt "ok" bei Erfolg zurück, sonst die Fehlermeldung als String.
+    Crasht nie – jeder Fehler wird abgefangen und zurückgegeben.
+    """
+    # Empfängeradresse muss vorhanden sein.
+    if not to_email:
+        return "Keine Empfänger-Adresse für diesen Lead vorhanden."
+
+    # Vollständigkeit der Zugangsdaten prüfen, bevor wir SMTP anfassen.
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, SMTP_HOST, SMTP_PORT]):
+        return ("SMTP-Zugangsdaten unvollständig – bitte EMAIL_SENDER, "
+                "EMAIL_PASSWORD, SMTP_HOST und SMTP_PORT in der .env setzen.")
+
+    try:
+        port = int(SMTP_PORT)
+    except (TypeError, ValueError):
+        return f"Ungültiger SMTP_PORT: {SMTP_PORT!r}"
+
+    # Signatur an den Nachrichtentext anhängen.
+    full_body = (body or "") + SIGNATURE
+
+    # Saubere Plaintext-Mail mit UTF-8 aufbauen.
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = DIRECT_SUBJECT
+    msg["From"] = formataddr(("Patrick", EMAIL_SENDER))
+    msg["To"] = to_email
+    msg["Reply-To"] = EMAIL_SENDER
+    msg.attach(MIMEText(full_body, "plain", "utf-8"))
+
+    # Versand via STARTTLS (Port 587). Robust gekapselt.
+    try:
+        with smtplib.SMTP(SMTP_HOST, port, timeout=30) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, [to_email], msg.as_string())
+        print("[Direct] Mail erfolgreich an", to_email, "gesendet")
+        return "ok"
+    except Exception as exc:
+        print("[Direct] FEHLER beim Versand:", exc)
+        return f"SMTP-Fehler: {exc}"
+
+
 def _run_job(job_id, keyword, city, max_leads, mode):
     """
     Hintergrund-Task: Führt den Outreach-Lauf Lead für Lead aus und
@@ -348,6 +421,19 @@ def status(job_id):
         )
 
     return snapshot
+
+
+@app.post("/send_single")
+def send_single(req: SendRequest):
+    """
+    Versendet GENAU EINE Mail an einen einzelnen Prospect (Modus "direct").
+
+    Sicherheit: Dieser Endpunkt wird ausschließlich durch einen bewussten
+    Button-Klick pro Lead ausgelöst. Im Hintergrund-Lauf geht NICHTS automatisch
+    raus – der Lauf erzeugt nur die Entwürfe.
+    """
+    result = send_single_mail(req.email, DIRECT_SUBJECT, req.message)
+    return {"status": result}
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +630,22 @@ PAGE_HTML = """<!DOCTYPE html>
     padding: 14px 16px;
     margin-top: 12px;
   }
+
+  /* Direkt-senden (nur Modus "direct") */
+  .direct-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  .send-btn {
+    padding: 9px 16px;
+    font-size: 0.9rem;
+    border-radius: 10px;
+    box-shadow: 0 0 12px rgba(124, 58, 237, 0.45);
+  }
+  .send-status { font-size: 0.88rem; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -593,6 +695,7 @@ PAGE_HTML = """<!DOCTYPE html>
 
 <script>
   let pollTimer = null;
+  let currentMode = "draft";  // Modus des zuletzt fertig gewordenen Laufs
 
   function startRun() {
     const keyword = document.getElementById("keyword").value.trim();
@@ -677,6 +780,7 @@ PAGE_HTML = """<!DOCTYPE html>
     document.getElementById("barFill").style.width = "100%";
     document.getElementById("progressText").textContent =
       "Fertig – " + (job.leads ? job.leads.length : 0) + " Leads verarbeitet.";
+    currentMode = job.mode || "draft";   // bestimmt, ob Direkt-senden-Buttons erscheinen
     renderResults(job.leads || []);
     renderReportStatus(job.report_status);
   }
@@ -722,6 +826,10 @@ PAGE_HTML = """<!DOCTYPE html>
     hat_social_media: "Social Media"
   };
 
+  // Hält die aktuell angezeigten Leads, damit die Direkt-senden-Buttons per
+  // Index auf den jeweiligen Lead (E-Mail + Nachricht) zugreifen können.
+  let currentLeads = [];
+
   function renderResults(leads) {
     const container = document.getElementById("results");
     if (!leads.length) {
@@ -732,10 +840,59 @@ PAGE_HTML = """<!DOCTYPE html>
     // Sicherheitshalber clientseitig nach Score absteigend sortieren.
     leads.sort((a, b) => (b.score || 0) - (a.score || 0));
 
-    container.innerHTML = leads.map(buildCard).join("");
+    currentLeads = leads;
+
+    // Im Modus "direct": optionales Test-Empfänger-Feld ÜBER der Lead-Liste.
+    let testBlock = "";
+    if (currentMode === "direct") {
+      testBlock = buildTestRecipientBlock();
+    }
+
+    container.innerHTML = testBlock + leads.map(buildCard).join("");
+
+    // Button-Beschriftungen an den (ggf. leeren) Test-Empfänger anpassen.
+    if (currentMode === "direct") updateSendButtons();
   }
 
-  function buildCard(lead) {
+  // Eingabefeld für einen Test-Empfänger (nur Modus "direct"). Steht hier eine
+  // Adresse, gehen ALLE Sende-Buttons gefahrlos an diese statt an die Prospects.
+  function buildTestRecipientBlock() {
+    return '' +
+      '<div class="card" id="testRecipientBox">' +
+        '<label for="testRecipient">Test-Empfänger (optional)</label>' +
+        '<input id="testRecipient" type="text" oninput="updateSendButtons()" ' +
+          'placeholder="leer lassen = echter Versand an Prospects" value="">' +
+        '<div class="meta" style="margin-top: 8px;">Wenn hier eine Adresse steht, ' +
+          'gehen ALLE Sende-Buttons an diese Adresse statt an die Prospects – ' +
+          'zum gefahrlosen Testen.</div>' +
+      "</div>";
+  }
+
+  // Liest den aktuellen Test-Empfänger aus dem Eingabefeld (leer = nicht gesetzt).
+  function getTestRecipient() {
+    const field = document.getElementById("testRecipient");
+    return field ? field.value.trim() : "";
+  }
+
+  // Passt Text/Farbe aller Sende-Buttons an den aktuellen Test-Empfänger an.
+  function updateSendButtons() {
+    const testEmail = getTestRecipient();
+    currentLeads.forEach((lead, idx) => {
+      const btn = document.getElementById("sendBtn-" + idx);
+      if (!btn || btn.dataset.sent === "1") return;  // bereits gesendete in Ruhe lassen
+      if (testEmail) {
+        btn.textContent = "TEST → an " + testEmail + " senden";
+        btn.style.background = "#E8862E";
+        btn.style.boxShadow = "0 0 12px rgba(232, 134, 46, 0.55)";
+      } else {
+        btn.textContent = "An " + lead.email + " senden";
+        btn.style.background = "";
+        btn.style.boxShadow = "";
+      }
+    });
+  }
+
+  function buildCard(lead, idx) {
     const features = lead.features || {};
     const tags = Object.keys(FEATURE_LABELS).map(key => {
       const on = !!features[key];
@@ -752,6 +909,18 @@ PAGE_HTML = """<!DOCTYPE html>
     if (lead.email)   meta += '<div class="meta">E-Mail: <a href="mailto:' + escapeAttr(lead.email) +
                               '">' + escapeHtml(lead.email) + "</a></div>";
 
+    // Direkt-senden-Block NUR im Modus "direct" und nur wenn eine E-Mail
+    // vorhanden ist. Der Versand passiert ausschließlich per Klick.
+    let directBlock = "";
+    if (currentMode === "direct" && lead.email) {
+      directBlock =
+        '<div class="direct-row">' +
+          '<button class="send-btn" id="sendBtn-' + idx + '" ' +
+            'onclick="sendSingle(' + idx + ')">An ' + escapeHtml(lead.email) + ' senden</button>' +
+          '<span class="send-status" id="sendStatus-' + idx + '"></span>' +
+        "</div>";
+    }
+
     return '' +
       '<div class="lead-card">' +
         '<div class="lead-head">' +
@@ -761,7 +930,54 @@ PAGE_HTML = """<!DOCTYPE html>
         meta +
         '<div class="tags">' + tags + "</div>" +
         '<div class="message-box">' + escapeHtml(lead.message || "") + "</div>" +
+        directBlock +
       "</div>";
+  }
+
+  // Versendet GENAU EINE Mail an den Prospect des angeklickten Leads.
+  function sendSingle(idx) {
+    const lead = currentLeads[idx];
+    if (!lead || !lead.email) return;
+
+    const btn = document.getElementById("sendBtn-" + idx);
+    const statusEl = document.getElementById("sendStatus-" + idx);
+
+    // Zieladresse: Test-Empfänger falls gesetzt, sonst die echte Prospect-Adresse.
+    const testEmail = getTestRecipient();
+    const target = testEmail || lead.email;
+
+    // Sicherheitsabfrage vor dem echten Versand.
+    if (!confirm("Diese Nachricht jetzt wirklich an " + target + " senden?")) {
+      return;
+    }
+
+    btn.disabled = true;
+    statusEl.style.color = "#9A8FB8";
+    statusEl.textContent = "Sende …";
+
+    fetch("/send_single", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: target, message: lead.message || "" })
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.status === "ok") {
+          btn.dataset.sent = "1";
+          statusEl.style.color = "#9BE8BE";
+          statusEl.textContent = "✓ Gesendet";
+          btn.textContent = "Gesendet";
+        } else {
+          statusEl.style.color = "#F2B8C6";
+          statusEl.textContent = "Fehler: " + (data.status || "unbekannt");
+          btn.disabled = false;
+        }
+      })
+      .catch(err => {
+        statusEl.style.color = "#F2B8C6";
+        statusEl.textContent = "Fehler: " + err.message;
+        btn.disabled = false;
+      });
   }
 
   // Einfache HTML-Escapes gegen kaputtes Markup / Injection.
