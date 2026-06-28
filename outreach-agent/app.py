@@ -18,8 +18,13 @@ Start:
   oder direkt:  python app.py
 """
 
+import os
 import uuid
+import smtplib
 import threading
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 
 import uvicorn
 from fastapi import FastAPI, BackgroundTasks
@@ -28,6 +33,8 @@ from pydantic import BaseModel
 
 # Einzelschritte aus dem bestehenden Agenten importieren – so können wir den
 # Fortschritt Lead für Lead anzeigen, statt nur run_agent() blind aufzurufen.
+# Beim Import von outreach_agent wird auch load_dotenv() ausgeführt, die .env
+# ist damit bereits geladen.
 from outreach_agent import (
     search_leads,
     scrape_website,
@@ -35,6 +42,17 @@ from outreach_agent import (
     score_lead,
     generate_message,
 )
+
+
+# ---------------------------------------------------------------------------
+# SMTP-/E-Mail-Konfiguration (aus .env)
+# ---------------------------------------------------------------------------
+
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = os.getenv("SMTP_PORT")
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +83,134 @@ def _update_job(job_id, **fields):
         job = JOBS.get(job_id)
         if job is not None:
             job.update(fields)
+
+
+# ---------------------------------------------------------------------------
+# Report-Versand per E-Mail (nur Modus "report")
+# ---------------------------------------------------------------------------
+
+# Lesbare Beschriftungen für die Feature-Flags (für die Report-Mail).
+_FEATURE_LABELS = {
+    "hat_buchungstool": "Buchungstool",
+    "hat_chatbot": "Chatbot",
+    "hat_kontaktformular": "Kontaktformular",
+    "hat_social_media": "Social Media",
+}
+
+
+def _esc(value):
+    """Minimal-Escaping, damit Lead-Daten das HTML der Mail nicht zerschießen."""
+    return (
+        str(value if value is not None else "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _build_report_html(leads, keyword, city):
+    """Baut den HTML-Body der Report-Mail: pro Lead eine übersichtliche Karte."""
+    cards = []
+    for lead in leads:
+        features = lead.get("features", {}) or {}
+        # Erkannte Features als kleine Tag-Liste (nur die aktiven anzeigen).
+        active = [label for key, label in _FEATURE_LABELS.items() if features.get(key)]
+        feature_html = (
+            " ".join(
+                f'<span style="display:inline-block;background:#2A1652;color:#D8D4E8;'
+                f'border:1px solid rgba(167,139,250,0.3);border-radius:8px;'
+                f'padding:2px 8px;font-size:12px;margin:0 6px 6px 0;">{_esc(f)}</span>'
+                for f in active
+            )
+            or '<span style="color:#9A8FB8;font-size:13px;">keine erkannt</span>'
+        )
+
+        # Optionale Kontaktzeilen.
+        meta_rows = []
+        if lead.get("address"):
+            meta_rows.append(f"<div>{_esc(lead['address'])}</div>")
+        if lead.get("phone"):
+            meta_rows.append(f"<div>Tel.: {_esc(lead['phone'])}</div>")
+        if lead.get("website"):
+            meta_rows.append(f"<div>Web: {_esc(lead['website'])}</div>")
+        if lead.get("email"):
+            meta_rows.append(f"<div>E-Mail: {_esc(lead['email'])}</div>")
+        meta_html = "".join(meta_rows)
+
+        message_html = _esc(lead.get("message", "")).replace("\n", "<br>")
+
+        cards.append(f"""
+        <div style="background:#1F0E3D;border:1px solid rgba(167,139,250,0.18);
+                    border-radius:14px;padding:18px 20px;margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="color:#A78BFA;font-size:17px;">{_esc(lead.get('name', 'Unbenannt'))}</strong>
+            <span style="background:#7C3AED;color:#fff;border-radius:999px;
+                         padding:3px 11px;font-size:13px;font-weight:bold;">
+              Score {_esc(lead.get('score', 0))}/100</span>
+          </div>
+          <div style="color:#9A8FB8;font-size:13px;margin:6px 0;">{meta_html}</div>
+          <div style="margin:8px 0;">{feature_html}</div>
+          <div style="background:#130623;border:1px solid rgba(167,139,250,0.18);
+                      border-radius:10px;padding:12px 14px;color:#D8D4E8;
+                      font-size:14px;line-height:1.5;">{message_html}</div>
+        </div>
+        """)
+
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<body style="margin:0;padding:24px;background:#17082E;
+             font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+  <div style="max-width:680px;margin:0 auto;">
+    <h1 style="color:#A78BFA;font-size:22px;margin:0 0 4px;">Outreach-Report</h1>
+    <p style="color:#9A8FB8;font-size:14px;margin:0 0 24px;">
+      {_esc(keyword)} in {_esc(city)} – {len(leads)} Leads
+    </p>
+    {''.join(cards)}
+  </div>
+</body>
+</html>"""
+
+
+def send_report(leads, keyword, city):
+    """
+    Versendet den gesammelten Lauf als HTML-Report-Mail (Modus "report").
+
+    Gibt "ok" bei Erfolg zurück, sonst die Fehlermeldung als String.
+    Crasht nie – jeder Fehler wird abgefangen und zurückgegeben.
+    """
+    # Vollständigkeit der Zugangsdaten prüfen, bevor wir SMTP anfassen.
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_HOST, SMTP_PORT]):
+        return ("SMTP-Zugangsdaten unvollständig – bitte EMAIL_SENDER, "
+                "EMAIL_PASSWORD, EMAIL_RECEIVER, SMTP_HOST und SMTP_PORT in der "
+                ".env setzen.")
+
+    try:
+        port = int(SMTP_PORT)
+    except (TypeError, ValueError):
+        return f"Ungültiger SMTP_PORT: {SMTP_PORT!r}"
+
+    subject = f"Outreach-Report: {keyword} in {city} – {len(leads)} Leads"
+
+    # Saubere HTML-Mail mit UTF-8 aufbauen.
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("Avolane Outreach Agent", EMAIL_SENDER))
+    msg["To"] = EMAIL_RECEIVER
+
+    html_body = _build_report_html(leads, keyword, city)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # Versand via STARTTLS (Port 587). Robust gekapselt.
+    try:
+        with smtplib.SMTP(SMTP_HOST, port, timeout=30) as server:
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, [EMAIL_RECEIVER], msg.as_string())
+        print("[Report] Mail erfolgreich an", EMAIL_RECEIVER, "gesendet")
+        return "ok"
+    except Exception as exc:
+        print("[Report] FEHLER beim Versand:", exc)
+        return f"SMTP-Fehler: {exc}"
 
 
 def _run_job(job_id, keyword, city, max_leads, mode):
@@ -119,14 +265,22 @@ def _run_job(job_id, keyword, city, max_leads, mode):
         # 3. Nach Score absteigend sortieren.
         enriched_leads.sort(key=lambda l: l["score"], reverse=True)
 
-        # 4. Job als fertig markieren.
-        _update_job(
-            job_id,
-            status="done",
-            current=total,
-            current_name="",
-            leads=enriched_leads,
-        )
+        # 4. Nur im Modus "report": ZUERST den Report verschicken, damit
+        #    report_status im selben finalen "done"-Update enthalten ist.
+        #    Sonst würde das Frontend bei "done" das Polling stoppen, bevor
+        #    der Versand-Status feststeht. ("draft" verschickt nichts,
+        #    "direct" bleibt vorerst funktionslos.)
+        done_fields = {
+            "status": "done",
+            "current": total,
+            "current_name": "",
+            "leads": enriched_leads,
+        }
+        if mode == "report":
+            done_fields["report_status"] = send_report(enriched_leads, keyword, city)
+
+        # 5. EIN finales Update mit status="done" (und ggf. report_status).
+        _update_job(job_id, **done_fields)
 
     except Exception as exc:
         # Jeder Fehler landet im Job-Status, nicht im Prozess-Crash.
@@ -524,6 +678,35 @@ PAGE_HTML = """<!DOCTYPE html>
     document.getElementById("progressText").textContent =
       "Fertig – " + (job.leads ? job.leads.length : 0) + " Leads verarbeitet.";
     renderResults(job.leads || []);
+    renderReportStatus(job.report_status);
+  }
+
+  // Report-Status-Banner (nur im Modus "report" gesetzt).
+  function renderReportStatus(reportStatus) {
+    if (!reportStatus) return;  // draft/direct oder noch nichts -> nichts anzeigen.
+
+    const ok = reportStatus === "ok";
+    const box = document.createElement("div");
+    box.style.borderRadius = "12px";
+    box.style.padding = "12px 16px";
+    box.style.marginBottom = "18px";
+    box.style.fontSize = "0.92rem";
+    box.style.fontWeight = "600";
+
+    if (ok) {
+      box.style.background = "#0F2E1A";
+      box.style.border = "1px solid #2FA86A";
+      box.style.color = "#9BE8BE";
+      box.textContent = "Report an hallo@avolane.de gesendet ✓";
+    } else {
+      box.style.background = "#3A1020";
+      box.style.border = "1px solid #C0395B";
+      box.style.color = "#F2B8C6";
+      box.textContent = "Report-Versand fehlgeschlagen: " + reportStatus;
+    }
+
+    const results = document.getElementById("results");
+    results.insertBefore(box, results.firstChild);
   }
 
   function showError(msg) {
