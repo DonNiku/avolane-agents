@@ -20,6 +20,7 @@ Start:
 
 import os
 import uuid
+import random
 import sqlite3
 import smtplib
 import threading
@@ -56,17 +57,36 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = os.getenv("SMTP_PORT")
 
-# Feste Signatur für den Direktversand an Prospects. Enthält Kontaktdaten und
-# einen einfachen Opt-out-Hinweis und wird an jede direkt versendete Mail
-# angehängt.
-SIGNATURE = """
+# Umschaltbare Signaturen für den Direktversand an Prospects. Die technische
+# Absenderadresse bleibt immer hallo@avolane.de – nur der sichtbare Signatur-
+# Block unten in der Mail wechselt zwischen Patrick und Salvatore.
+SIGNATURES = {
+    "patrick": """
+
+Viele Grüße aus Mainz
+Patrick
 
 --
-Patrick
-0176 82447546
-hallo@avolane.de
+Patrick · 0176 82447546 · hallo@avolane.de
 
-Wenn Sie keine weitere Nachricht von mir möchten, geben Sie mir einfach kurz Bescheid – dann melde ich mich nicht wieder."""
+Wenn Sie keine weitere Nachricht von mir möchten, geben Sie mir einfach kurz Bescheid – dann melde ich mich nicht wieder.""",
+    "salvatore": """
+
+Viele Grüße aus Mainz
+Salvatore
+
+--
+Salvatore · 0170 1405797 · hallo@avolane.de
+
+Wenn Sie keine weitere Nachricht von mir möchten, geben Sie mir einfach kurz Bescheid – dann melde ich mich nicht wieder.""",
+}
+
+# Angezeigter Absendername (From-Header) je nach gewähltem sender. Die technische
+# Adresse bleibt immer EMAIL_SENDER (hallo@avolane.de) – nur der Name wechselt.
+SENDER_DISPLAY_NAMES = {
+    "patrick": "Patrick – Avolane",
+    "salvatore": "Salvatore – Avolane",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +121,8 @@ class SendRequest(BaseModel):
     recipient_name: str = ""
     keyword: str = ""
     city: str = ""
+    # Sichtbare Absender-Signatur ("patrick" oder "salvatore"), Default "patrick".
+    sender: str = "patrick"
 
 
 # ---------------------------------------------------------------------------
@@ -302,19 +324,29 @@ def send_report(leads, keyword, city):
         return f"SMTP-Fehler: {exc}"
 
 
-# Fester, neutraler Betreff für den Direktversand an Prospects (nicht werblich).
-DIRECT_SUBJECT = "Kurze Frage zu Ihrem Ablauf"
+# Rotierender Betreff-Pool für den Direktversand an Prospects (Mischung aus
+# neutral und neugierig). Pro Mail wird per Zufall einer ausgewählt, damit nicht
+# alle Nachrichten denselben Betreff tragen.
+SUBJECT_POOL = [
+    "Kurze Frage zu Ihrem Ablauf",
+    "Eine Frage zu Ihrer Terminvergabe",
+    "Kurz nachgefragt",
+    "Mir ist etwas auf Ihrer Website aufgefallen",
+    "Eine ehrlich gemeinte Frage",
+    "Kurze Frage aus Mainz",
+]
 
 
-def send_single_mail(to_email, subject, body):
+def send_single_mail(to_email, subject, body, sender="patrick"):
     """
     Versendet EINE einzelne Plaintext-Mail an einen Prospect (Modus "direct").
 
     - SMTP via Zoho (SMTP_HOST:SMTP_PORT), STARTTLS (Port 587), Login mit
       EMAIL_SENDER / EMAIL_PASSWORD. Absender und Reply-To: EMAIL_SENDER.
-    - Der feste, neutrale Betreff DIRECT_SUBJECT wird verwendet (der subject-
-      Parameter wird bewusst nicht für werbliche Betreffzeilen genutzt).
-    - SIGNATURE wird an den body angehängt.
+    - Betreff: Wird kein expliziter subject übergeben, wählt die Funktion per
+      Zufall einen Betreff aus SUBJECT_POOL.
+    - Signatur: Je nach sender ("patrick"/"salvatore") wird die passende
+      Signatur aus SIGNATURES an den body gehängt (Fallback "patrick").
 
     Gibt "ok" bei Erfolg zurück, sonst die Fehlermeldung als String.
     Crasht nie – jeder Fehler wird abgefangen und zurückgegeben.
@@ -333,13 +365,22 @@ def send_single_mail(to_email, subject, body):
     except (TypeError, ValueError):
         return f"Ungültiger SMTP_PORT: {SMTP_PORT!r}"
 
+    # Betreff: expliziten subject nutzen, sonst zufällig aus dem Pool wählen.
+    chosen_subject = subject if subject else random.choice(SUBJECT_POOL)
+
+    # Passende Signatur wählen (unbekannter sender -> Fallback "patrick").
+    signature = SIGNATURES.get(sender, SIGNATURES["patrick"])
+
+    # Anzeigename für den From-Header (unbekannter sender -> Fallback "patrick").
+    display_name = SENDER_DISPLAY_NAMES.get(sender, SENDER_DISPLAY_NAMES["patrick"])
+
     # Signatur an den Nachrichtentext anhängen.
-    full_body = (body or "") + SIGNATURE
+    full_body = (body or "") + signature
 
     # Saubere Plaintext-Mail mit UTF-8 aufbauen.
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = DIRECT_SUBJECT
-    msg["From"] = formataddr(("Patrick", EMAIL_SENDER))
+    msg["Subject"] = chosen_subject
+    msg["From"] = formataddr((display_name, EMAIL_SENDER))
     msg["To"] = to_email
     msg["Reply-To"] = EMAIL_SENDER
     msg.attach(MIMEText(full_body, "plain", "utf-8"))
@@ -503,7 +544,8 @@ def send_single(req: SendRequest):
     Button-Klick pro Lead ausgelöst. Im Hintergrund-Lauf geht NICHTS automatisch
     raus – der Lauf erzeugt nur die Entwürfe.
     """
-    result = send_single_mail(req.email, DIRECT_SUBJECT, req.message)
+    # Kein fester Betreff: send_single_mail wählt selbst einen aus SUBJECT_POOL.
+    result = send_single_mail(req.email, None, req.message, req.sender)
 
     # Nur echte, erfolgreiche Versände in den Verlauf schreiben. Test-Mails
     # (is_test=True) bleiben außen vor, um den Verlauf nicht zu verfälschen.
@@ -914,6 +956,13 @@ PAGE_HTML = """<!DOCTYPE html>
           <option value="draft" selected>Nur Entwürfe (kein Versand)</option>
           <option value="report">Report an mich</option>
           <option value="direct">Direkt an Prospects</option>
+        </select>
+      </div>
+      <div>
+        <label for="sender">Absender</label>
+        <select id="sender">
+          <option value="patrick" selected>Patrick</option>
+          <option value="salvatore">Salvatore</option>
         </select>
       </div>
     </div>
@@ -1345,7 +1394,8 @@ PAGE_HTML = """<!DOCTYPE html>
         is_test: !!testEmail,   // Test-Empfänger gesetzt -> nicht in den Verlauf
         recipient_name: lead.name || "",
         keyword: currentKeyword,
-        city: currentCity
+        city: currentCity,
+        sender: (document.getElementById("sender") || {}).value || "patrick"
       })
     })
       .then(r => r.json())

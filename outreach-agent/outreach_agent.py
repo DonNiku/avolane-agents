@@ -181,7 +181,43 @@ def search_leads(keyword, city, max_leads):
 
 # Bestandteile, die eine gefundene Adresse als unecht entlarven
 # (Tracking-Mails, Platzhalter, in Dateinamen/Bildern eingebettete "@" usw.).
-EMAIL_BLOCKLIST = ["sentry", "example", ".png", ".jpg", "@2x", "wixpress"]
+EMAIL_BLOCKLIST = [
+    "sentry", "example", ".png", ".jpg", "@2x", "wixpress",
+    "ihre-email", "ihremail", "mustermann", "domain.de", "email@", "name@",
+]
+
+
+def deobfuscate_text(text):
+    """
+    Wandelt verschleierte E-Mail-Schreibweisen in normale Adressen um, damit das
+    übliche E-Mail-Regex danach greift. Beispiele:
+
+      "info [at] beispiel [punkt] de"  -> "info@beispiel.de"
+      "info(at)beispiel(punkt)de"      -> "info@beispiel.de"
+      "info @ beispiel . de"           -> "info@beispiel.de"
+      "info[at]beispiel.de"            -> "info@beispiel.de"
+
+    Vorgehen (alles case-insensitive):
+      - Klammer-Varianten von "at"/"punkt"/"dot" zuerst ersetzen,
+      - dann die durch Leerzeichen abgetrennten Wort-Varianten,
+      - zuletzt überflüssige Leerzeichen rund um @ und . entfernen.
+    """
+    if not text:
+        return ""
+
+    result = text
+    # "[at]", "(at)", "[ at ]" usw. (inkl. umgebender Leerzeichen).
+    result = re.sub(r"\s*[\[\(]\s*at\s*[\]\)]\s*", "@", result, flags=re.IGNORECASE)
+    # " at " als eigenes Wort (mit Leerzeichen drumherum).
+    result = re.sub(r"\s+at\s+", "@", result, flags=re.IGNORECASE)
+    # "[punkt]"/"(punkt)"/"[dot]"/"(dot)".
+    result = re.sub(r"\s*[\[\(]\s*(?:punkt|dot)\s*[\]\)]\s*", ".", result, flags=re.IGNORECASE)
+    # " punkt "/" dot " als eigenes Wort.
+    result = re.sub(r"\s+(?:punkt|dot)\s+", ".", result, flags=re.IGNORECASE)
+    # Überflüssige Leerzeichen rund um @ und . entfernen ("info @ beispiel . de").
+    result = re.sub(r"\s*@\s*", "@", result)
+    result = re.sub(r"\s*\.\s*", ".", result)
+    return result
 
 
 def extract_email(soup, text):
@@ -193,9 +229,11 @@ def extract_email(soup, text):
       1. Zuerst alle mailto:-Links durchsuchen und die erste gültige Adresse
          nehmen.
       2. Falls keine gefunden: im Text per Regex nach E-Mail-Adressen suchen.
-      3. Adressen herausfiltern, die offensichtlich keine echten
+      3. NEU: den Text entschleiern (verschleierte Schreibweisen wie
+         "info [at] beispiel [punkt] de") und erneut per Regex suchen.
+      4. Adressen herausfiltern, die offensichtlich keine echten
          Kontaktadressen sind (siehe EMAIL_BLOCKLIST).
-      4. Die erste plausible Adresse als String zurückgeben, sonst leeren
+      5. Die erste plausible Adresse als String zurückgeben, sonst leeren
          String. Robuste Fehlerbehandlung – kein Crash.
     """
     email_pattern = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
@@ -218,6 +256,11 @@ def extract_email(soup, text):
 
         # 2. Fallback: im sichtbaren Text suchen.
         for match in re.findall(email_pattern, text or ""):
+            if is_plausible(match):
+                return match
+
+        # 3. NEU: verschleierte Adressen entschleiern und erneut suchen.
+        for match in re.findall(email_pattern, deobfuscate_text(text or "")):
             if is_plausible(match):
                 return match
     except Exception as exc:
@@ -636,7 +679,26 @@ Schreibe eine kurze, persönliche deutsche Erstnachricht nach diesen Regeln:
 - Setze konkret an EINEM beobachteten manuellen ABLAUF an (z. B. dass Termine
   vermutlich von Hand per Telefon/Mail vereinbart werden). Benenne diesen
   Ablauf greifbar – nicht nur "mir ist etwas aufgefallen".
-- EINSTIEG (verbindliche Vorgabe): Eröffne die Nachricht so: {chosen_style}
+- PFLICHT-BEGRÜSSUNG (steht IMMER ganz am Anfang, vor allem anderen): Jede
+  Nachricht MUSS mit einer persönlichen Anrede beginnen – auch wenn der
+  Einstiegs-Stil unten "direkt mit der Frage starten" o. Ä. sagt. Die Anrede
+  kommt IMMER zuerst, erst DANACH folgt der unten gewählte Einstiegs-Stil.
+  Regeln für die Anrede:
+    * Verwende NIEMALS "Herr" oder "Frau" – das Geschlecht ist nicht sicher
+      bestimmbar.
+    * Ist der Lead-Name erkennbar eine konkrete Einzelperson MIT akademischem
+      Titel (z. B. Dr.), nutze eine neutrale namentliche Anrede aus Titel +
+      Nachname, OHNE Herr/Frau. Achte darauf, den Nachnamen korrekt zu erkennen
+      (in "Sulaiman Sandra Dr.med.dent." ist "Sulaiman" der Nachname).
+      Beispiele: "Sulaiman Sandra Dr.med.dent." -> "Guten Tag Dr. Sulaiman,";
+      "Dr. med. dent. Dieter Irrgang" -> "Guten Tag Dr. Irrgang,".
+    * Ist eine Einzelperson OHNE akademischen Titel erkennbar, nutze schlicht
+      "Guten Tag," (eine reine Nachname-Anrede wirkt ohne Herr/Frau unüblich).
+    * Ist der Name ein Unternehmen/Praxisname ohne klare Einzelperson
+      (z. B. "AllDent Zahnzentrum Mainz"), nutze "Guten Tag,".
+    * Im Zweifel IMMER "Guten Tag,".
+- EINSTIEG (verbindliche Vorgabe): Eröffne die Nachricht NACH der Anrede so:
+  {chosen_style}
   Beginne NICHT mit "ich bin selbst aus Mainz und schaue mir an, wie lokale
   Unternehmen ihren Alltag organisieren" oder Ähnlichem. Wirke nicht wie eine
   Vorlage. Vermeide die Floskel "wie lokale Praxen/Unternehmen ihren Alltag
@@ -676,12 +738,18 @@ Schreibe eine kurze, persönliche deutsche Erstnachricht nach diesen Regeln:
   in Abwandlungen): {verbotene_woerter_str}.
 - ANREDE: Verwende durchgängig die höfliche Anrede "Sie" (Siezen). Niemals
   duzen. Das gilt für die gesamte Nachricht inklusive Begrüßung und Abschluss.
-- UNTERSCHRIFT: Falls die Nachricht eine Grußformel/Unterschrift enthält, wird
-  IMMER nur mit dem Vornamen "{SENDER_NAME}" unterschrieben. Erfinde NIEMALS
-  einen anderen Namen und setze NIEMALS einen Platzhalter wie "[Name]",
-  "[Dein Name]" o. Ä.
+- KEIN ABSCHLUSS-GRUSS, KEINE UNTERSCHRIFT: Die Nachricht endet NACH der Frage.
+  Schreibe am Ende KEINE Grußformel ("Viele Grüße", "Herzliche Grüße", "Beste
+  Grüße" o. Ä.), KEINEN Namen, KEINE Unterschrift und KEINE Grußzeile. Setze
+  auch KEINEN Platzhalter wie "[Name]" / "[Dein Name]". Die Unterschrift wird
+  separat angehängt. Die Anrede am ANFANG bleibt dagegen Pflicht (siehe oben).
 - Ton: locker, auf Augenhöhe, als Gründer aus Mainz, der die Praxis kennt.
   Nie aufdringlich.
+- PERSÖNLICHERER TON: Die Nachricht soll etwas wärmer und persönlicher klingen,
+  ohne anbiedernd zu werden. Erlaubt sind ein, zwei natürliche, menschliche
+  Formulierungen (echtes Interesse, lockere aber höfliche Sprache). Es gilt
+  trotzdem weiter: kein Verkauf, kein Lösungsangebot, kein Tech-Vokabular,
+  maximal 4 Sätze (zusätzlich zur Anrede), durchgängig Sie.
 - Maximal 4–5 Sätze.
 - Gib NUR den reinen Nachrichtentext aus, ohne Betreff, ohne Anführungszeichen,
   ohne Erklärungen drumherum.
