@@ -937,6 +937,18 @@ PAGE_HTML = """<!DOCTYPE html>
   <div class="card">
     <div class="row">
       <div>
+        <label for="keywordPreset">Branche (Vorlage)</label>
+        <select id="keywordPreset" onchange="applyKeywordPreset(this)">
+          <option value="">– Branche wählen –</option>
+          <option value="Zahnarzt">Zahnarzt</option>
+          <option value="Friseur">Friseur</option>
+          <option value="Steuerberater">Steuerberater</option>
+          <option value="Handwerker Betrieb">Handwerker</option>
+          <option value="Restaurant">Gastronomie / Restaurant</option>
+          <option value="Hotel">Hotel</option>
+          <option value="Unternehmensberatung">Coach / Berater</option>
+          <option value="Immobilienmakler">Immobilienmakler</option>
+        </select>
         <label for="keyword">Schlagwort</label>
         <input id="keyword" type="text" placeholder="z. B. Zahnarzt" value="">
       </div>
@@ -1076,6 +1088,14 @@ PAGE_HTML = """<!DOCTYPE html>
     const p = n => String(n).padStart(2, "0");
     return p(d.getDate()) + "." + p(d.getMonth() + 1) + "." + d.getFullYear() +
            ", " + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
+
+  // Branchen-Vorlage: trägt den gewählten Suchbegriff ins Schlagwort-Feld ein.
+  // Das Textfeld bleibt voll editierbar; bei leerer Auswahl passiert nichts.
+  function applyKeywordPreset(sel) {
+    if (sel && sel.value) {
+      document.getElementById("keyword").value = sel.value;
+    }
   }
 
   function startRun() {
