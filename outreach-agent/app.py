@@ -20,8 +20,10 @@ Start:
 
 import os
 import uuid
+import sqlite3
 import smtplib
 import threading
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
@@ -93,6 +95,75 @@ class SendRequest(BaseModel):
     """Eingabe-Payload für POST /send_single (Direktversand an einen Prospect)."""
     email: str
     message: str
+    # Optionale Verlaufs-Metadaten. is_test=True (Test-Empfänger-Feld war gefüllt)
+    # verhindert, dass der Versand im echten Verlauf landet.
+    is_test: bool = False
+    recipient_name: str = ""
+    keyword: str = ""
+    city: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Versand-Verlauf (SQLite)
+# ---------------------------------------------------------------------------
+
+# Datenbankdatei im selben Ordner wie diese Datei.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sent_history.db")
+
+
+def init_db():
+    """Legt die Tabelle sent_mails an, falls sie noch nicht existiert."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sent_mails (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sent_at TEXT,
+                    recipient_name TEXT,
+                    recipient_email TEXT,
+                    message TEXT,
+                    keyword TEXT,
+                    city TEXT
+                )
+                """
+            )
+    except Exception as exc:
+        # DB-Probleme dürfen den App-Start nicht verhindern.
+        print("[DB] FEHLER bei init_db:", exc)
+
+
+def log_sent_mail(recipient_name, recipient_email, message, keyword, city):
+    """
+    Schreibt einen Verlaufseintrag mit aktuellem ISO-Zeitstempel.
+
+    Robust: Ein DB-Fehler wird nur geloggt und nie weitergereicht, damit der
+    Versand davon nicht abbricht.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                INSERT INTO sent_mails
+                    (sent_at, recipient_name, recipient_email, message, keyword, city)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now().isoformat(),
+                    recipient_name or "",
+                    recipient_email or "",
+                    message or "",
+                    keyword or "",
+                    city or "",
+                ),
+            )
+    except Exception as exc:
+        print("[DB] FEHLER bei log_sent_mail:", exc)
+
+
+# Tabelle einmalig beim App-Start (Modul-Import) sicherstellen – funktioniert
+# auch unter `uvicorn app:app`, nicht nur im __main__-Block.
+init_db()
 
 
 def _update_job(job_id, **fields):
@@ -433,7 +504,102 @@ def send_single(req: SendRequest):
     raus – der Lauf erzeugt nur die Entwürfe.
     """
     result = send_single_mail(req.email, DIRECT_SUBJECT, req.message)
+
+    # Nur echte, erfolgreiche Versände in den Verlauf schreiben. Test-Mails
+    # (is_test=True) bleiben außen vor, um den Verlauf nicht zu verfälschen.
+    if result == "ok" and not req.is_test:
+        log_sent_mail(
+            req.recipient_name,
+            req.email,
+            req.message,
+            req.keyword,
+            req.city,
+        )
+
     return {"status": result}
+
+
+@app.get("/history")
+def history():
+    """Gibt alle Verlaufseinträge als JSON-Liste zurück (neueste zuerst)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT id, sent_at, recipient_name, recipient_email,
+                       message, keyword, city
+                FROM sent_mails
+                ORDER BY sent_at DESC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        print("[DB] FEHLER bei /history:", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(exc)},
+        )
+
+
+@app.get("/history/emails")
+def history_emails():
+    """
+    Gibt nur die bereits kontaktierten E-Mail-Adressen zurück (eindeutig,
+    lowercase) – Grundlage für die Doppel-Anschreiben-Warnung im Frontend.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT LOWER(recipient_email) FROM sent_mails "
+                "WHERE recipient_email IS NOT NULL AND recipient_email != ''"
+            ).fetchall()
+        return [row[0] for row in rows]
+    except Exception as exc:
+        print("[DB] FEHLER bei /history/emails:", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(exc)},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test-Hilfsendpunkte (nur zum Prüfen der Doppel-Anschreiben-Warnung)
+# ---------------------------------------------------------------------------
+
+@app.get("/test/add_history")
+def test_add_history():
+    """Legt einen manuellen Test-Verlaufseintrag an."""
+    try:
+        log_sent_mail(
+            "TEST Zahnpoint Mainz",
+            "post@zahnpoint-mainz.de",
+            "Dies ist ein manueller Testeintrag.",
+            "Zahnarzt",
+            "Mainz",
+        )
+        return {"status": "ok", "info": "Testeintrag angelegt"}
+    except Exception as exc:
+        print("[DB] FEHLER bei /test/add_history:", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(exc)},
+        )
+
+
+@app.get("/test/clear_history")
+def test_clear_history():
+    """Löscht ALLE Verlaufseinträge (zum Aufräumen nach einem Test)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM sent_mails")
+        return {"status": "ok", "info": "Verlauf geleert"}
+    except Exception as exc:
+        print("[DB] FEHLER bei /test/clear_history:", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(exc)},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -646,12 +812,84 @@ PAGE_HTML = """<!DOCTYPE html>
     box-shadow: 0 0 12px rgba(124, 58, 237, 0.45);
   }
   .send-status { font-size: 0.88rem; font-weight: 600; }
+
+  /* Tab-Navigation */
+  .tabs { display: flex; gap: 8px; margin-bottom: 28px; }
+  .tab-btn {
+    background: var(--bg-card);
+    color: var(--text-muted);
+    border: 1px solid rgba(167, 139, 250, 0.2);
+    border-radius: 10px;
+    padding: 10px 22px;
+    font-size: 0.95rem;
+    font-weight: 700;
+    box-shadow: none;
+  }
+  .tab-btn:hover { box-shadow: none; }
+  .tab-btn.active {
+    background: var(--accent);
+    color: #fff;
+    box-shadow: 0 0 18px rgba(124, 58, 237, 0.55);
+  }
+
+  /* Verlauf */
+  .history-item {
+    background: var(--bg-card);
+    border: 1px solid rgba(167, 139, 250, 0.15);
+    border-radius: 12px;
+    padding: 14px 18px;
+    margin-bottom: 12px;
+  }
+  .history-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    flex-wrap: wrap;
+  }
+  .history-name { color: var(--accent-light); font-weight: 700; }
+  .history-email { color: var(--text-light); font-size: 0.9rem; }
+  .history-date { color: var(--text-muted); font-size: 0.85rem; white-space: nowrap; }
+  .history-msg {
+    display: none;
+    margin-top: 12px;
+    background: #130623;
+    border: 1px solid rgba(167, 139, 250, 0.18);
+    border-radius: 10px;
+    padding: 14px 16px;
+    white-space: pre-wrap;
+    font-size: 0.9rem;
+  }
+  .history-msg.open { display: block; }
+
+  /* Doppel-Anschreiben-Warnung auf der Lead-Karte */
+  .contacted-warn {
+    display: inline-block;
+    margin-top: 12px;
+    background: #3A2410;
+    border: 1px solid #E8862E;
+    color: #F4C28A;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    font-weight: 700;
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Avolane Outreach Agent</h1>
   <p class="subtitle">Lokale Leads finden, bewerten und persönlich ansprechen.</p>
+
+  <!-- Tab-Navigation -->
+  <div class="tabs">
+    <button class="tab-btn active" id="tabBtn-outreach" onclick="showTab('outreach')">Outreach</button>
+    <button class="tab-btn" id="tabBtn-history" onclick="showTab('history')">Verlauf</button>
+  </div>
+
+  <!-- ==================== TAB: OUTREACH ==================== -->
+  <div id="tab-outreach">
 
   <!-- Eingabemaske -->
   <div class="card">
@@ -691,11 +929,105 @@ PAGE_HTML = """<!DOCTYPE html>
 
   <!-- Ergebnis -->
   <div id="results"></div>
+
+  </div><!-- /tab-outreach -->
+
+  <!-- ==================== TAB: VERLAUF ==================== -->
+  <div id="tab-history" style="display: none;">
+    <div class="card">
+      <label for="historySearch">Verlauf durchsuchen</label>
+      <input id="historySearch" type="text" oninput="filterHistory()"
+             placeholder="Firmenname oder E-Mail …" value="" style="margin-bottom: 0;">
+    </div>
+    <div id="historyList"></div>
+  </div><!-- /tab-history -->
 </div>
 
 <script>
   let pollTimer = null;
   let currentMode = "draft";  // Modus des zuletzt fertig gewordenen Laufs
+  let currentKeyword = "";    // Suchbegriff des laufenden/letzten Laufs (für den Verlauf)
+  let currentCity = "";       // Stadt des laufenden/letzten Laufs (für den Verlauf)
+  let contactedEmails = new Set();  // bereits kontaktierte Adressen (lowercase) für die Doppel-Warnung
+
+  // -------------------- Tab-Umschaltung --------------------
+  function showTab(name) {
+    const isHistory = name === "history";
+    document.getElementById("tab-outreach").style.display = isHistory ? "none" : "block";
+    document.getElementById("tab-history").style.display = isHistory ? "block" : "none";
+    document.getElementById("tabBtn-outreach").classList.toggle("active", !isHistory);
+    document.getElementById("tabBtn-history").classList.toggle("active", isHistory);
+    if (isHistory) loadHistory();
+  }
+
+  // -------------------- Verlaufs-Ansicht --------------------
+  let historyData = [];
+
+  function loadHistory() {
+    const container = document.getElementById("historyList");
+    container.innerHTML = '<div class="card">Lade …</div>';
+    fetch("/history")
+      .then(r => r.json())
+      .then(data => {
+        historyData = Array.isArray(data) ? data : [];
+        renderHistory();
+      })
+      .catch(err => {
+        container.innerHTML = '<div class="error-box">Verlauf konnte nicht geladen werden: ' +
+          escapeHtml(err.message) + "</div>";
+      });
+  }
+
+  function filterHistory() { renderHistory(); }
+
+  function renderHistory() {
+    const container = document.getElementById("historyList");
+
+    if (!historyData.length) {
+      container.innerHTML = '<div class="card">Noch keine Mails versendet.</div>';
+      return;
+    }
+
+    const q = (document.getElementById("historySearch").value || "").trim().toLowerCase();
+    let list = historyData;
+    if (q) {
+      list = list.filter(e =>
+        String(e.recipient_name || "").toLowerCase().includes(q) ||
+        String(e.recipient_email || "").toLowerCase().includes(q));
+    }
+
+    if (!list.length) {
+      container.innerHTML = '<div class="card">Keine Treffer für „' + escapeHtml(q) + '".</div>';
+      return;
+    }
+
+    container.innerHTML = list.map((e, i) =>
+      '<div class="history-item">' +
+        '<div class="history-head" onclick="toggleHistoryMsg(' + i + ')">' +
+          '<div>' +
+            '<span class="history-name">' + escapeHtml(e.recipient_name || "—") + "</span> " +
+            '<span class="history-email">' + escapeHtml(e.recipient_email || "") + "</span>" +
+          "</div>" +
+          '<span class="history-date">' + escapeHtml(formatDate(e.sent_at)) + "</span>" +
+        "</div>" +
+        '<div class="history-msg" id="historyMsg-' + i + '">' + escapeHtml(e.message || "") + "</div>" +
+      "</div>"
+    ).join("");
+  }
+
+  function toggleHistoryMsg(i) {
+    const el = document.getElementById("historyMsg-" + i);
+    if (el) el.classList.toggle("open");
+  }
+
+  // ISO-Zeitstempel -> "27.06.2026, 14:30"
+  function formatDate(iso) {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso || "";
+    const p = n => String(n).padStart(2, "0");
+    return p(d.getDate()) + "." + p(d.getMonth() + 1) + "." + d.getFullYear() +
+           ", " + p(d.getHours()) + ":" + p(d.getMinutes());
+  }
 
   function startRun() {
     const keyword = document.getElementById("keyword").value.trim();
@@ -707,6 +1039,11 @@ PAGE_HTML = """<!DOCTYPE html>
       alert("Bitte Schlagwort und Stadt angeben.");
       return;
     }
+
+    // Suchbegriff/Stadt des Laufs merken, damit sie beim Direktversand in den
+    // Verlauf geschrieben werden können.
+    currentKeyword = keyword;
+    currentCity = city;
 
     // UI in den Lauf-Zustand versetzen.
     const btn = document.getElementById("startBtn");
@@ -842,13 +1179,33 @@ PAGE_HTML = """<!DOCTYPE html>
 
     currentLeads = leads;
 
+    // Im Modus "direct" zuerst die bereits kontaktierten Adressen laden, damit
+    // die Doppel-Anschreiben-Warnung direkt beim ersten Rendern sichtbar ist.
+    if (currentMode === "direct") {
+      fetch("/history/emails")
+        .then(r => r.json())
+        .then(list => {
+          contactedEmails = new Set((Array.isArray(list) ? list : []).map(e => String(e).toLowerCase()));
+        })
+        .catch(() => { contactedEmails = new Set(); })
+        .finally(paintResults);
+    } else {
+      contactedEmails = new Set();
+      paintResults();
+    }
+  }
+
+  // Zeichnet die aktuell gehaltenen Leads (currentLeads) in den Ergebnisbereich.
+  function paintResults() {
+    const container = document.getElementById("results");
+
     // Im Modus "direct": optionales Test-Empfänger-Feld ÜBER der Lead-Liste.
     let testBlock = "";
     if (currentMode === "direct") {
       testBlock = buildTestRecipientBlock();
     }
 
-    container.innerHTML = testBlock + leads.map(buildCard).join("");
+    container.innerHTML = testBlock + currentLeads.map(buildCard).join("");
 
     // Button-Beschriftungen an den (ggf. leeren) Test-Empfänger anpassen.
     if (currentMode === "direct") updateSendButtons();
@@ -874,16 +1231,28 @@ PAGE_HTML = """<!DOCTYPE html>
     return field ? field.value.trim() : "";
   }
 
-  // Passt Text/Farbe aller Sende-Buttons an den aktuellen Test-Empfänger an.
+  // Prüft, ob die Adresse eines Leads bereits im Verlauf steht.
+  function isContacted(lead) {
+    return !!(lead && lead.email && contactedEmails.has(lead.email.toLowerCase()));
+  }
+
+  // Passt Text/Farbe aller Sende-Buttons an Test-Empfänger und Verlauf an.
   function updateSendButtons() {
     const testEmail = getTestRecipient();
+    const orangeShadow = "0 0 12px rgba(232, 134, 46, 0.55)";
     currentLeads.forEach((lead, idx) => {
       const btn = document.getElementById("sendBtn-" + idx);
       if (!btn || btn.dataset.sent === "1") return;  // bereits gesendete in Ruhe lassen
       if (testEmail) {
+        // Test-Versand: alle Buttons gehen an die Test-Adresse.
         btn.textContent = "TEST → an " + testEmail + " senden";
         btn.style.background = "#E8862E";
-        btn.style.boxShadow = "0 0 12px rgba(232, 134, 46, 0.55)";
+        btn.style.boxShadow = orangeShadow;
+      } else if (isContacted(lead)) {
+        // Echter Versand, aber Adresse wurde bereits kontaktiert -> orange warnen.
+        btn.textContent = "An " + lead.email + " senden";
+        btn.style.background = "#E8862E";
+        btn.style.boxShadow = orangeShadow;
       } else {
         btn.textContent = "An " + lead.email + " senden";
         btn.style.background = "";
@@ -913,7 +1282,12 @@ PAGE_HTML = """<!DOCTYPE html>
     // vorhanden ist. Der Versand passiert ausschließlich per Klick.
     let directBlock = "";
     if (currentMode === "direct" && lead.email) {
+      // Doppel-Anschreiben-Warnung, falls die Adresse schon im Verlauf steht.
+      const warn = isContacted(lead)
+        ? '<div class="contacted-warn">⚠ Bereits kontaktiert</div>'
+        : "";
       directBlock =
+        warn +
         '<div class="direct-row">' +
           '<button class="send-btn" id="sendBtn-' + idx + '" ' +
             'onclick="sendSingle(' + idx + ')">An ' + escapeHtml(lead.email) + ' senden</button>' +
@@ -946,6 +1320,13 @@ PAGE_HTML = """<!DOCTYPE html>
     const testEmail = getTestRecipient();
     const target = testEmail || lead.email;
 
+    // Doppel-Anschreiben-Warnung nur beim echten Versand (nicht bei Test).
+    if (!testEmail && isContacted(lead)) {
+      if (!confirm("Diese Adresse wurde bereits kontaktiert. Trotzdem senden?")) {
+        return;
+      }
+    }
+
     // Sicherheitsabfrage vor dem echten Versand.
     if (!confirm("Diese Nachricht jetzt wirklich an " + target + " senden?")) {
       return;
@@ -958,12 +1339,22 @@ PAGE_HTML = """<!DOCTYPE html>
     fetch("/send_single", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: target, message: lead.message || "" })
+      body: JSON.stringify({
+        email: target,
+        message: lead.message || "",
+        is_test: !!testEmail,   // Test-Empfänger gesetzt -> nicht in den Verlauf
+        recipient_name: lead.name || "",
+        keyword: currentKeyword,
+        city: currentCity
+      })
     })
       .then(r => r.json())
       .then(data => {
         if (data.status === "ok") {
           btn.dataset.sent = "1";
+          // Bei echtem Versand die Adresse als kontaktiert merken, damit ein
+          // erneuter Klick gewarnt wird (Test-Versand zählt nicht).
+          if (!testEmail && lead.email) contactedEmails.add(lead.email.toLowerCase());
           statusEl.style.color = "#9BE8BE";
           statusEl.textContent = "✓ Gesendet";
           btn.textContent = "Gesendet";
